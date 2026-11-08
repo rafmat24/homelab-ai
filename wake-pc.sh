@@ -19,23 +19,17 @@ DESTINATION_MAC="$RTX_MAC"
 # Define OPENWRT_IP=192.168.1.1 in the .env file
 ROUTER_IP="${OPENWRT_IP:-192.168.1.1}" 
 
-SOURCE_WAKE=$(ping -c 1 -W 2 "$DESTINATION_IP" | grep "1 received")
-
-if [ -z "$SOURCE_WAKE" ]; then
+if ! ping -c 3 -W 2 "$DESTINATION_IP" >/dev/null 2>&1; then
     echo "PC is offline. Checking OpenWRT connectivity..."
     
-    OPENWRT_WAKE=$(ping -c 1 -W 2 "$ROUTER_IP" | grep "1 received")
-    
-    if [ -z "$OPENWRT_WAKE" ]; then
+    if ! ping -c 3 -W 2 "$ROUTER_IP" >/dev/null 2>&1; then
         echo "OpenWRT router ($ROUTER_IP) is offline. Cannot send Wake-on-LAN packet."
         exit 1
     fi
     
     echo "OpenWRT online. Sending etherwake command..."
     # Use SSH options to prevent hanging on the fingerprint prompt (StrictHostKeyChecking=no)
-    ssh -o StrictHostKeyChecking=no -o BatchMode=yes root@"$ROUTER_IP" "etherwake -i wan $DESTINATION_MAC"
-    
-    if [ $? -eq 0 ]; then
+    if ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@$ROUTER_IP" "etherwake -i wan $DESTINATION_MAC"; then
         echo "Wake-on-LAN packet sent successfully."
     else
         echo "Failed to send Wake-on-LAN packet."
