@@ -9,7 +9,9 @@ from datetime import datetime
 # ==============================================================================
 # CONFIGURATION & INITIALIZATION
 # ==============================================================================
-BASE_DIR = "/opt/ai-orchestrator"
+BASE_DIR = os.path.abspath(
+    os.getenv("HOMELAB_AI_DIR", os.path.dirname(os.path.abspath(__file__)))
+)
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 DATA_FILE = os.path.join(BASE_DIR, "logs", "latest_market_data.json")
 REPORT_FILE = os.path.join(BASE_DIR, "logs", f"report_{datetime.now().strftime('%Y%m%d')}.md")

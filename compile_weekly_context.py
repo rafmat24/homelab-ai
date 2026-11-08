@@ -7,7 +7,9 @@ import sys
 # ==============================================================================
 # CONFIGURATION & DIRECTORY SETUP
 # ==============================================================================
-BASE_DIR = "/opt/ai-orchestrator"
+BASE_DIR = os.path.abspath(
+    os.getenv("HOMELAB_AI_DIR", os.path.dirname(os.path.abspath(__file__)))
+)
 DB_FILE = os.path.join(BASE_DIR, "logs", "market_data.db")
 OUTPUT_FILE = os.path.join(BASE_DIR, "logs", "latest_market_data.json")
 

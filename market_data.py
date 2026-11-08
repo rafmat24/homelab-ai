@@ -9,7 +9,9 @@ from datetime import datetime
 # ==============================================================================
 # CONFIGURATION & DIRECTORY SETUP
 # ==============================================================================
-BASE_DIR = "/opt/ai-orchestrator"
+BASE_DIR = os.path.abspath(
+    os.getenv("HOMELAB_AI_DIR", os.path.dirname(os.path.abspath(__file__)))
+)
 CONFIG_FILE = os.path.join(BASE_DIR, "configs", "portfolio.json")
 DB_FILE = os.path.join(BASE_DIR, "logs", "market_data.db")
 ANOMALY_FLAG_FILE = os.path.join(BASE_DIR, "logs", "trigger_anomaly.flag")
