@@ -1,3 +1,6 @@
 .env
 params
 __pycache__
+venv/
+logs/
+.lxc-runtime/
