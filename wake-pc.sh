@@ -19,6 +19,10 @@ DESTINATION_MAC="$RTX_MAC"
 # Define OPENWRT_IP=192.168.1.1 in the .env file
 ROUTER_IP="${OPENWRT_IP:-192.168.1.1}" 
 
+echo "DESTINATION_IP: $DESTINATION_IP"
+echo "DESTINATION_MAC: $DESTINATION_MAC"
+echo "ROUTER_IP: $ROUTER_IP"
+
 if ! ping -c 3 -W 2 "$DESTINATION_IP" >/dev/null 2>&1; then
     echo "PC is offline. Checking OpenWRT connectivity..."
     
