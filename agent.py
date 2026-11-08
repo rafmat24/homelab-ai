@@ -9,13 +9,15 @@ from datetime import datetime
 # ==============================================================================
 # CONFIGURATION & INITIALIZATION
 # ==============================================================================
-BASE_DIR = os.path.abspath(
-    os.getenv("HOMELAB_AI_DIR", os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_BASE_DIR = (
+    os.path.dirname(SCRIPT_DIR) if os.path.basename(SCRIPT_DIR) == "code" else SCRIPT_DIR
 )
+BASE_DIR = os.path.abspath(os.getenv("HOMELAB_AI_DIR", DEFAULT_BASE_DIR))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 DATA_FILE = os.path.join(BASE_DIR, "logs", "latest_market_data.json")
 REPORT_FILE = os.path.join(BASE_DIR, "logs", f"report_{datetime.now().strftime('%Y%m%d')}.md")
-WAKE_SCRIPT_PATH = os.path.join(BASE_DIR, "wake-pc.sh")
+WAKE_SCRIPT_PATH = os.path.join(SCRIPT_DIR, "wake-pc.sh")
 
 load_dotenv(ENV_PATH)
 
