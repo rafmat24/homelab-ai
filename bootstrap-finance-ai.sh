@@ -139,6 +139,32 @@ echo -e ""
 setup_ai_orchestrator() {
     local id="$1"
     echo -e "${YELLOW}[->] Preparing Python environment for AI Orchestrator...${NC}"
+
+    # Keep the generated configuration in the Proxmox project directory and in the container.
+    echo -e "${YELLOW}[->] Writing .env configuration...${NC}"
+    if ! cat <<EOF > "$SCRIPT_DIR/.env"
+# RTX Station Configuration
+RTX_IP=${RTX_IP}
+RTX_MAC=${RTX_MAC}
+RTX_SSH_USER=${RTX_USER}
+
+# Ollama Endpoint
+OLLAMA_URL=http://${RTX_IP}:11434/api/generate
+EOF
+    then
+        echo -e "${RED}[X] Failed to write $SCRIPT_DIR/.env.${NC}" >&2
+        return 1
+    fi
+    if ! chmod 600 "$SCRIPT_DIR/.env"; then
+        echo -e "${RED}[X] Failed to secure $SCRIPT_DIR/.env.${NC}" >&2
+        return 1
+    fi
+    if ! pct exec "$id" -- mkdir -p "$HOMELAB_AI_DIR" ||
+       ! pct push "$id" "$SCRIPT_DIR/.env" "$HOMELAB_AI_DIR/.env" ||
+       ! pct exec "$id" -- chmod 600 "$HOMELAB_AI_DIR/.env"; then
+        echo -e "${RED}[X] Failed to install the protected .env file in the container.${NC}" >&2
+        return 1
+    fi
     
     # 1. Update and install system dependencies
     if ! pct exec "$id" -- apt-get update -y ||
@@ -169,30 +195,6 @@ setup_ai_orchestrator() {
     fi
     
     PUB_KEY=$(pct exec "$id" -- cat /root/.ssh/id_ed25519.pub)
-
-    # 5. Generate .env configuration file
-    echo -e "${YELLOW}[->] Injecting .env configuration...${NC}"
-    cat <<EOF > /tmp/orchestrator.env
-# RTX Station Configuration
-RTX_IP=${RTX_IP}
-RTX_MAC=${RTX_MAC}
-RTX_SSH_USER=${RTX_USER}
-
-# Ollama Endpoint
-OLLAMA_URL=http://${RTX_IP}:11434/api/generate
-EOF
-    if ! pct push "$id" /tmp/orchestrator.env "$HOMELAB_AI_DIR/.env"; then
-        rm -f /tmp/orchestrator.env
-        echo -e "${RED}[X] Failed to copy the environment file into the container.${NC}" >&2
-        return 1
-    fi
-    rm -f /tmp/orchestrator.env
-    
-    # Ustawienie odpowiednich uprawnień
-    if ! pct exec "$id" -- chmod 600 "$HOMELAB_AI_DIR/.env"; then
-        echo -e "${RED}[X] Failed to secure the environment file.${NC}" >&2
-        return 1
-    fi
 
     echo -e "${GREEN}[+] AI Orchestrator setup completed inside container.${NC}"
 }
