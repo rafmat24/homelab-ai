@@ -236,19 +236,21 @@ fi
 
 echo -e "${GREEN}[*] Script execution finished.${NC}"
 
-# Display the SSH key for RTX authorization
+# Display the SSH key for RTX and OpenWRT authorization
 if [ -n "$PUB_KEY" ]; then
     echo -e "${CYAN}============================================================${NC}"
-    echo -e "${CYAN}[!] IMPORTANT: SSH KEY FOR RTX SHUTDOWN${NC}"
-    echo -e "${CYAN}To allow Proxmox to shut down your RTX machine automatically,${NC}"
-    echo -e "${CYAN}copy the following public key to your RTX machine's authorized_keys file:${NC}"
+    echo -e "${CYAN}[!] IMPORTANT: AUTHORIZE THIS SSH KEY ON BOTH TARGETS${NC}"
+    echo -e "${CYAN}Append this public key to the RTX user's authorized_keys file${NC}"
+    echo -e "${CYAN}to allow shutdown commands, and to OpenWRT's /etc/dropbear/authorized_keys${NC}"
+    echo -e "${CYAN}to allow Wake-on-LAN commands. Do not overwrite existing keys.${NC}"
     echo -e "${CYAN}(Windows path: C:\\Users\\${RTX_USER}\\.ssh\\authorized_keys)${NC}"
     echo -e "${CYAN}(Linux path: /home/${RTX_USER}/.ssh/authorized_keys)${NC}"
+    echo -e "${CYAN}(OpenWRT path: /etc/dropbear/authorized_keys for the root account)${NC}"
     echo -e "${CYAN}------------------------------------------------------------${NC}"
     echo -e "${YELLOW}$PUB_KEY${NC}"
     echo -e "${CYAN}============================================================${NC}"
     
-    # Zapisz klucz do pliku tekstowego na serwerze Proxmox w razie czego
+    # Save a backup of the public key on the Proxmox host.
     echo "$PUB_KEY" > "/root/ai_orchestrator_${CT_ID}_pubkey.txt"
     echo -e "${CYAN}[i] A backup of this key has been saved to /root/ai_orchestrator_${CT_ID}_pubkey.txt${NC}"
 fi
