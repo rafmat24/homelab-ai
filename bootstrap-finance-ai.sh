@@ -10,9 +10,9 @@ NET_BRIDGE="vmbr0"
 NET_GATEWAY="192.168.1.1"
 HOMELAB_AI_DIR="${HOMELAB_AI_DIR:-/opt/homelab-ai}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-HOMELAB_AI_SOURCE_DIR="${HOMELAB_AI_SOURCE_DIR:-$SCRIPT_DIR}"
-HOMELAB_AI_RUNTIME_DIR="${HOMELAB_AI_RUNTIME_DIR:-$SCRIPT_DIR/.lxc-code}"
-LEGACY_RUNTIME_DIR="$SCRIPT_DIR/.lxc-runtime"
+HOMELAB_AI_SOURCE_DIR="${HOMELAB_AI_SOURCE_DIR:-$SCRIPT_DIR/runtime}"
+LEGACY_RUNTIME_DIR="$SCRIPT_DIR/.lxc-code"
+OLDER_RUNTIME_DIR="$SCRIPT_DIR/.lxc-runtime"
 
 if [[ "$HOMELAB_AI_DIR" != /* ]]; then
     echo "[X] HOMELAB_AI_DIR must be an absolute path: $HOMELAB_AI_DIR" >&2
@@ -24,25 +24,12 @@ if [[ "$HOMELAB_AI_SOURCE_DIR" != /* || ! -d "$HOMELAB_AI_SOURCE_DIR" ]]; then
     exit 1
 fi
 
-if [[ "$HOMELAB_AI_SOURCE_DIR" == *,* || "$HOMELAB_AI_DIR" == *,* || "$HOMELAB_AI_RUNTIME_DIR" == *,* ]]; then
+if [[ "$HOMELAB_AI_SOURCE_DIR" == *,* || "$HOMELAB_AI_DIR" == *,* ]]; then
     echo "[X] Mount paths cannot contain commas." >&2
     exit 1
 fi
 
 HOMELAB_AI_SOURCE_DIR="$(cd -- "$HOMELAB_AI_SOURCE_DIR" && pwd)"
-
-if [[ "$HOMELAB_AI_RUNTIME_DIR" != /* ]]; then
-    echo "[X] HOMELAB_AI_RUNTIME_DIR must be an absolute path: $HOMELAB_AI_RUNTIME_DIR" >&2
-    exit 1
-fi
-
-mkdir -p "$HOMELAB_AI_RUNTIME_DIR" || exit 1
-HOMELAB_AI_RUNTIME_DIR="$(cd -- "$HOMELAB_AI_RUNTIME_DIR" && pwd)"
-
-if [[ "$HOMELAB_AI_RUNTIME_DIR" == "$HOMELAB_AI_SOURCE_DIR" || "$HOMELAB_AI_SOURCE_DIR" == "$HOMELAB_AI_RUNTIME_DIR/"* ]]; then
-    echo "[X] HOMELAB_AI_RUNTIME_DIR must not contain the project source directory." >&2
-    exit 1
-fi
 
 # Log Colors
 GREEN='\033[0;32m'
@@ -53,7 +40,7 @@ NC='\033[0m'
 
 echo -e "${GREEN}[*] Starting AI Orchestrator deployment...${NC}"
 echo -e "${CYAN}[*] Writable runtime state directory in container: ${HOMELAB_AI_DIR}${NC}"
-echo -e "${CYAN}[*] Staging runtime code in: ${HOMELAB_AI_RUNTIME_DIR}${NC}"
+echo -e "${CYAN}[*] Mounting runtime code directly from: ${HOMELAB_AI_SOURCE_DIR}${NC}"
 echo -e "${CYAN}[*] Runtime code will be mounted read-only at ${HOMELAB_AI_DIR}/code.${NC}"
 
 # ==============================================================================
@@ -69,7 +56,7 @@ container_exists() {
     return 1
 }
 
-stage_runtime_files() {
+validate_runtime_files() {
     local file
     local -a runtime_files=(
         agent.py
@@ -80,16 +67,6 @@ stage_runtime_files() {
         portfolio.json
     )
 
-    if [[ -e "$HOMELAB_AI_RUNTIME_DIR/bootstrap-finance-ai.sh" ]]; then
-        echo -e "${RED}[X] Runtime mount directory contains bootstrap-finance-ai.sh; choose a clean HOMELAB_AI_RUNTIME_DIR.${NC}" >&2
-        return 1
-    fi
-
-    if [[ -e "$HOMELAB_AI_RUNTIME_DIR/.env" || -e "$HOMELAB_AI_RUNTIME_DIR/venv" || -e "$HOMELAB_AI_RUNTIME_DIR/logs" ]]; then
-        echo -e "${RED}[X] Runtime code directory contains state files; choose a clean HOMELAB_AI_RUNTIME_DIR.${NC}" >&2
-        return 1
-    fi
-
     for file in "${runtime_files[@]}"; do
         if [[ ! -f "$HOMELAB_AI_SOURCE_DIR/$file" ]]; then
             echo -e "${RED}[X] Required runtime file not found: $HOMELAB_AI_SOURCE_DIR/$file${NC}" >&2
@@ -97,28 +74,26 @@ stage_runtime_files() {
         fi
     done
 
-    mkdir -p "$HOMELAB_AI_RUNTIME_DIR" || return 1
-    for file in "${runtime_files[@]}"; do
-        cp "$HOMELAB_AI_SOURCE_DIR/$file" "$HOMELAB_AI_RUNTIME_DIR/$file" || return 1
-    done
-    chmod +x "$HOMELAB_AI_RUNTIME_DIR/run-daily.sh" "$HOMELAB_AI_RUNTIME_DIR/wake-pc.sh"
+    return 0
 }
-
-RUNTIME_MOUNT_ADDED=0
 
 configure_runtime_mount() {
     local id="$1"
     local current_mount
-    local expected_mount="${HOMELAB_AI_RUNTIME_DIR},mp=${HOMELAB_AI_DIR}/code,ro=1"
+    local expected_mount="${HOMELAB_AI_SOURCE_DIR},mp=${HOMELAB_AI_DIR}/code,ro=1"
 
     current_mount="$(pct config "$id" | sed -n 's/^mp0: //p')"
     if [[ "$current_mount" == "$expected_mount" ]]; then
         return 0
     fi
 
-    if [[ "$current_mount" == "${HOMELAB_AI_RUNTIME_DIR},mp=${HOMELAB_AI_DIR}" ||
+    if [[ "$current_mount" == "${LEGACY_RUNTIME_DIR},mp=${HOMELAB_AI_DIR}/code,ro=1" ||
+          "$current_mount" == "${OLDER_RUNTIME_DIR},mp=${HOMELAB_AI_DIR}/code,ro=1" ||
+          "$current_mount" == "${HOMELAB_AI_SOURCE_DIR},mp=${HOMELAB_AI_DIR}" ||
+          "$current_mount" == "${SCRIPT_DIR},mp=${HOMELAB_AI_DIR}/code,ro=1" ||
           "$current_mount" == "${LEGACY_RUNTIME_DIR},mp=${HOMELAB_AI_DIR}" ||
-          "$current_mount" == "${HOMELAB_AI_SOURCE_DIR},mp=${HOMELAB_AI_DIR}" ]]; then
+          "$current_mount" == "${OLDER_RUNTIME_DIR},mp=${HOMELAB_AI_DIR}" ||
+          "$current_mount" == "${SCRIPT_DIR},mp=${HOMELAB_AI_DIR}" ]]; then
         if pct status "$id" | grep -q 'status: running'; then
             echo -e "${RED}[X] Stop container $id before moving its old project mount to the read-only code directory.${NC}" >&2
             return 1
@@ -138,7 +113,6 @@ configure_runtime_mount() {
     fi
 
     if pct set "$id" --mp0 "$expected_mount"; then
-        RUNTIME_MOUNT_ADDED=1
         return 0
     fi
 
@@ -227,8 +201,8 @@ EOF
 # MAIN EXECUTION
 # ==============================================================================
 
-if ! stage_runtime_files; then
-    echo -e "${RED}[X] Failed to stage runtime files.${NC}" >&2
+if ! validate_runtime_files; then
+    echo -e "${RED}[X] Runtime code directory is incomplete.${NC}" >&2
     exit 1
 fi
 

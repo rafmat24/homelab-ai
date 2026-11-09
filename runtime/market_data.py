@@ -11,7 +11,9 @@ from datetime import datetime
 # ==============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BASE_DIR = (
-    os.path.dirname(SCRIPT_DIR) if os.path.basename(SCRIPT_DIR) == "code" else SCRIPT_DIR
+    os.path.dirname(SCRIPT_DIR)
+    if os.path.basename(SCRIPT_DIR) in {"code", "runtime"}
+    else SCRIPT_DIR
 )
 BASE_DIR = os.path.abspath(os.getenv("HOMELAB_AI_DIR", DEFAULT_BASE_DIR))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "portfolio.json")

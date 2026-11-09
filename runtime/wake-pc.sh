@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 echo "SCRIPT_DIR: $SCRIPT_DIR"
 DEFAULT_BASE_DIR="$SCRIPT_DIR"
 echo "DEFAULT_BASE_DIR: $DEFAULT_BASE_DIR"
-if [ "$(basename "$SCRIPT_DIR")" = "code" ]; then
+if [ "$(basename "$SCRIPT_DIR")" = "code" ] || [ "$(basename "$SCRIPT_DIR")" = "runtime" ]; then
     DEFAULT_BASE_DIR="$(dirname "$SCRIPT_DIR")"
 fi
 BASE_DIR="${HOMELAB_AI_DIR:-$DEFAULT_BASE_DIR}"

@@ -3,7 +3,7 @@
 
 CODE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_BASE_DIR="$CODE_DIR"
-if [ "$(basename "$CODE_DIR")" = "code" ]; then
+if [ "$(basename "$CODE_DIR")" = "code" ] || [ "$(basename "$CODE_DIR")" = "runtime" ]; then
     DEFAULT_BASE_DIR="$(dirname "$CODE_DIR")"
 fi
 BASE_DIR="${HOMELAB_AI_DIR:-$DEFAULT_BASE_DIR}"
