@@ -136,7 +136,7 @@ def fetch_technical_data(ticker_symbol: str) -> dict:
 
         return {
             "current_price": round(current_price, 2),
-            "currency": hist.info.get('currency', 'EUR') if hasattr(hist, 'info') else 'N/A',
+            "currency": ticker.info.get('currency', 'N/A'),
             "daily_change_pct": round(daily_change, 2),
             "weekly_change_pct": round(weekly_change, 2),
             "sma200_dist_pct": round(sma_dist_pct, 2),
