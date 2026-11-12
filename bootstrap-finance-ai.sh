@@ -132,11 +132,21 @@ read -p "3. Enter RTX Station IP Address (e.g., 192.168.1.10): " RTX_IP
 read -p "4. Enter RTX Station MAC Address (e.g., AA:BB:CC:DD:EE:FF): " RTX_MAC
 read -p "5. Enter RTX Station SSH User (e.g., rafal): " RTX_USER
 if [[ -z "${ALPHAVANTAGE_API_KEY:-}" ]]; then
-    read -s -p "6. Enter Alpha Vantage API key: " ALPHAVANTAGE_API_KEY
-    echo
+    if [[ -f "$SCRIPT_DIR/.env" ]]; then
+        ALPHAVANTAGE_API_KEY="$(awk -F= '$1 == "ALPHAVANTAGE_API_KEY" { sub(/^[^=]*=/, ""); print; exit }' "$SCRIPT_DIR/.env")"
+    fi
 fi
 if [[ -z "$ALPHAVANTAGE_API_KEY" ]]; then
-    echo "[X] Alpha Vantage API key is required." >&2
+    if [[ -r /dev/tty ]]; then
+        IFS= read -r -s -p "6. Paste Alpha Vantage API key (input is hidden; press Enter when done): " ALPHAVANTAGE_API_KEY </dev/tty
+        echo >&2
+    else
+        echo "[X] Alpha Vantage API key is required. Set ALPHAVANTAGE_API_KEY or add it to $SCRIPT_DIR/.env." >&2
+        exit 1
+    fi
+fi
+if [[ -z "$ALPHAVANTAGE_API_KEY" ]]; then
+    echo "[X] No Alpha Vantage API key was entered." >&2
     exit 1
 fi
 echo -e ""
