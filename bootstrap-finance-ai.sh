@@ -131,6 +131,14 @@ echo -e "${CYAN}--- RTX Station Details ---${NC}"
 read -p "3. Enter RTX Station IP Address (e.g., 192.168.1.10): " RTX_IP
 read -p "4. Enter RTX Station MAC Address (e.g., AA:BB:CC:DD:EE:FF): " RTX_MAC
 read -p "5. Enter RTX Station SSH User (e.g., rafal): " RTX_USER
+if [[ -z "${ALPHAVANTAGE_API_KEY:-}" ]]; then
+    read -s -p "6. Enter Alpha Vantage API key: " ALPHAVANTAGE_API_KEY
+    echo
+fi
+if [[ -z "$ALPHAVANTAGE_API_KEY" ]]; then
+    echo "[X] Alpha Vantage API key is required." >&2
+    exit 1
+fi
 echo -e ""
 
 # ==============================================================================
@@ -142,11 +150,13 @@ setup_ai_orchestrator() {
 
     # Keep the generated configuration in the Proxmox project directory and in the container.
     echo -e "${YELLOW}[->] Writing .env configuration...${NC}"
+    umask 077
     if ! cat <<EOF > "$SCRIPT_DIR/.env"
 # RTX Station Configuration
 RTX_IP=${RTX_IP}
 RTX_MAC=${RTX_MAC}
 RTX_SSH_USER=${RTX_USER}
+ALPHAVANTAGE_API_KEY=${ALPHAVANTAGE_API_KEY}
 
 # Ollama Endpoint
 OLLAMA_URL=http://${RTX_IP}:11434/api/generate
@@ -181,8 +191,8 @@ EOF
     fi
     
     # 3. Install Python packages inside venv
-    echo -e "${YELLOW}[->] Installing Python packages (yfinance, requests, wakeonlan, python-dotenv)...${NC}"
-    if ! pct exec "$id" -- "$HOMELAB_AI_DIR/venv/bin/pip" install yfinance requests wakeonlan python-dotenv; then
+    echo -e "${YELLOW}[->] Installing Python packages (requests, python-dotenv)...${NC}"
+    if ! pct exec "$id" -- "$HOMELAB_AI_DIR/venv/bin/pip" install requests python-dotenv; then
         echo -e "${RED}[X] Failed to install Python packages.${NC}" >&2
         return 1
     fi
