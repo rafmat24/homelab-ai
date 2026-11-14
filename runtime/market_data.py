@@ -29,6 +29,8 @@ ANOMALY_DROP_THRESHOLD = -3.0
 ALPHAVANTAGE_API_URL = "https://www.alphavantage.co/query"
 ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 API_REQUEST_INTERVAL_SECONDS = 12
+API_NETWORK_RETRIES = 3
+API_RETRY_BACKOFF_SECONDS = (5, 15, 30)
 _last_api_request_at = 0.0
 
 ALPHAVANTAGE_EXCHANGE_SUFFIXES = {
@@ -132,29 +134,51 @@ def fetch_alphavantage_data(function: str, **params) -> dict:
     if not ALPHAVANTAGE_API_KEY:
         raise AlphaVantageError("ALPHAVANTAGE_API_KEY is not configured.")
 
-    elapsed = time.monotonic() - _last_api_request_at
-    if _last_api_request_at and elapsed < API_REQUEST_INTERVAL_SECONDS:
-        time.sleep(API_REQUEST_INTERVAL_SECONDS - elapsed)
+    response = None
+    for attempt in range(API_NETWORK_RETRIES + 1):
+        elapsed = time.monotonic() - _last_api_request_at
+        if _last_api_request_at and elapsed < API_REQUEST_INTERVAL_SECONDS:
+            time.sleep(API_REQUEST_INTERVAL_SECONDS - elapsed)
+
+        try:
+            response = requests.get(
+                ALPHAVANTAGE_API_URL,
+                params={
+                    "function": function,
+                    "apikey": ALPHAVANTAGE_API_KEY,
+                    **params,
+                },
+                timeout=30,
+            )
+            _last_api_request_at = time.monotonic()
+            response.raise_for_status()
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            _last_api_request_at = time.monotonic()
+            if attempt < API_NETWORK_RETRIES:
+                delay = API_RETRY_BACKOFF_SECONDS[attempt]
+                print(
+                    f"[-] Alpha Vantage network error; retrying in {delay}s "
+                    f"({attempt + 1}/{API_NETWORK_RETRIES})."
+                )
+                time.sleep(delay)
+                continue
+            error_message = str(e).replace(ALPHAVANTAGE_API_KEY, "[redacted]")
+            raise AlphaVantageError(
+                f"Alpha Vantage network request failed after "
+                f"{API_NETWORK_RETRIES + 1} attempts: {error_message}",
+                stop_run=True,
+            ) from e
+        except requests.exceptions.RequestException as e:
+            _last_api_request_at = time.monotonic()
+            error_message = str(e).replace(ALPHAVANTAGE_API_KEY, "[redacted]")
+            raise AlphaVantageError(
+                f"Alpha Vantage request failed: {error_message}",
+                stop_run=True,
+            ) from e
 
     try:
-        response = requests.get(
-            ALPHAVANTAGE_API_URL,
-            params={
-                "function": function,
-                "apikey": ALPHAVANTAGE_API_KEY,
-                **params,
-            },
-            timeout=30,
-        )
-        _last_api_request_at = time.monotonic()
-        response.raise_for_status()
         data = response.json()
-    except requests.exceptions.RequestException as e:
-        error_message = str(e).replace(ALPHAVANTAGE_API_KEY, "[redacted]")
-        raise AlphaVantageError(
-            f"Alpha Vantage request failed: {error_message}",
-            stop_run=True,
-        ) from e
     except ValueError as e:
         raise AlphaVantageError("Alpha Vantage returned invalid JSON.") from e
 
@@ -347,13 +371,16 @@ def main():
             break
 
     valid_tickers = [ticker for ticker in all_tickers if ticker in market_data]
-    try:
-        news_by_ticker = fetch_news_data(valid_tickers)
-    except AlphaVantageError as e:
-        print(f"[!] Alpha Vantage news error: {e}")
-        if e.stop_run:
-            failed_tickers.extend(ticker for ticker in valid_tickers if ticker not in failed_tickers)
+    if stop_scraping:
         news_by_ticker = {ticker: ["Error fetching news."] for ticker in valid_tickers}
+    else:
+        try:
+            news_by_ticker = fetch_news_data(valid_tickers)
+        except AlphaVantageError as e:
+            print(f"[!] Alpha Vantage news error: {e}")
+            if e.stop_run:
+                failed_tickers.extend(ticker for ticker in valid_tickers if ticker not in failed_tickers)
+            news_by_ticker = {ticker: ["Error fetching news."] for ticker in valid_tickers}
 
     for category, tickers in portfolio.items():
         for ticker in tickers:

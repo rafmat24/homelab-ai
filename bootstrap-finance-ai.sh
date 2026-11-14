@@ -128,7 +128,7 @@ echo -e "${CYAN}------------------------------------------------------------${NC
 read -p "1. Enter Container ID (e.g., 200): " CT_ID
 read -p "2. Enter Container IP with CIDR (e.g., 192.168.1.60/24): " CT_IP
 echo -e "${CYAN}--- RTX Station Details ---${NC}"
-read -p "3. Enter RTX Station IP Address (e.g., 192.168.1.10): " RTX_IP
+read -p "3. Enter RTX Station sIP Address (e.g., 192.168.1.10): " RTX_IP
 read -p "4. Enter RTX Station MAC Address (e.g., AA:BB:CC:DD:EE:FF): " RTX_MAC
 read -p "5. Enter RTX Station SSH User (e.g., rafal): " RTX_USER
 if [[ -z "${ALPHAVANTAGE_API_KEY:-}" ]]; then
