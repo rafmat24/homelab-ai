@@ -14,6 +14,45 @@ HOMELAB_AI_SOURCE_DIR="${HOMELAB_AI_SOURCE_DIR:-$SCRIPT_DIR/runtime}"
 LEGACY_RUNTIME_DIR="$SCRIPT_DIR/.lxc-code"
 OLDER_RUNTIME_DIR="$SCRIPT_DIR/.lxc-runtime"
 
+CONFIG_FILE=""
+usage() {
+    cat <<EOF
+Usage: $0 [--config FILE]
+
+Without --config, the script prompts for each required setting.
+The config file uses plain KEY=value lines (no shell expansion):
+  CT_ID=200
+  CT_IP=192.168.1.60/24
+  RTX_IP=192.168.1.10
+  RTX_MAC=AA:BB:CC:DD:EE:FF
+  RTX_USER=rafal
+  ALPHAVANTAGE_API_KEY=your_api_key
+
+Keep the config file private (for example: chmod 600 FILE).
+EOF
+}
+
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -c|--config)
+            if [[ $# -ne 2 || -z "$2" ]]; then
+                usage >&2
+                exit 2
+            fi
+            CONFIG_FILE="$2"
+            ;;
+        *)
+            echo "[X] Unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+fi
+
 if [[ "$HOMELAB_AI_DIR" != /* ]]; then
     echo "[X] HOMELAB_AI_DIR must be an absolute path: $HOMELAB_AI_DIR" >&2
     exit 1
@@ -122,31 +161,79 @@ configure_runtime_mount() {
 # ==============================================================================
 # INTERACTIVE STEP: Prompt for Variables
 # ==============================================================================
-echo -e "${CYAN}------------------------------------------------------------${NC}"
-echo -e "${CYAN}[?] CONFIGURATION STEP${NC}"
-echo -e "${CYAN}------------------------------------------------------------${NC}"
-read -p "1. Enter Container ID (e.g., 200): " CT_ID
-read -p "2. Enter Container IP with CIDR (e.g., 192.168.1.60/24): " CT_IP
-echo -e "${CYAN}--- RTX Station Details ---${NC}"
-read -p "3. Enter RTX Station sIP Address (e.g., 192.168.1.10): " RTX_IP
-read -p "4. Enter RTX Station MAC Address (e.g., AA:BB:CC:DD:EE:FF): " RTX_MAC
-read -p "5. Enter RTX Station SSH User (e.g., rafal): " RTX_USER
-if [[ -z "${ALPHAVANTAGE_API_KEY:-}" ]]; then
-    if [[ -f "$SCRIPT_DIR/.env" ]]; then
-        ALPHAVANTAGE_API_KEY="$(awk -F= '$1 == "ALPHAVANTAGE_API_KEY" { sub(/^[^=]*=/, ""); print; exit }' "$SCRIPT_DIR/.env")"
+if [[ -n "$CONFIG_FILE" ]]; then
+    if [[ ! -f "$CONFIG_FILE" || ! -r "$CONFIG_FILE" ]]; then
+        echo "[X] Config file is not a readable regular file: $CONFIG_FILE" >&2
+        exit 1
     fi
-fi
-if [[ -z "$ALPHAVANTAGE_API_KEY" ]]; then
+
+    CT_ID=""
+    CT_IP=""
+    RTX_IP=""
+    RTX_MAC=""
+    RTX_USER=""
+    ALPHAVANTAGE_API_KEY=""
+    seen_keys=" "
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" != *=* ]]; then
+            echo "[X] Invalid config line; expected KEY=value." >&2
+            exit 1
+        fi
+
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        case "$key" in
+            CT_ID|CT_IP|RTX_IP|RTX_MAC|RTX_USER|ALPHAVANTAGE_API_KEY)
+                ;;
+            *)
+                echo "[X] Unsupported config key: $key" >&2
+                exit 1
+                ;;
+        esac
+        case "$seen_keys" in
+            *" $key "*)
+                echo "[X] Duplicate config key: $key" >&2
+                exit 1
+                ;;
+        esac
+        seen_keys+="$key "
+        printf -v "$key" '%s' "$value"
+    done < "$CONFIG_FILE"
+else
+    echo -e "${CYAN}------------------------------------------------------------${NC}"
+    echo -e "${CYAN}[?] CONFIGURATION STEP${NC}"
+    echo -e "${CYAN}------------------------------------------------------------${NC}"
+    read -r -p "1. Enter Container ID (e.g., 200): " CT_ID
+    read -r -p "2. Enter Container IP with CIDR (e.g., 192.168.1.60/24): " CT_IP
+    echo -e "${CYAN}--- RTX Station Details ---${NC}"
+    read -r -p "3. Enter RTX Station IP Address (e.g., 192.168.1.10): " RTX_IP
+    read -r -p "4. Enter RTX Station MAC Address (e.g., AA:BB:CC:DD:EE:FF): " RTX_MAC
+    read -r -p "5. Enter RTX Station SSH User (e.g., rafal): " RTX_USER
     if [[ -r /dev/tty ]]; then
         IFS= read -r -s -p "6. Paste Alpha Vantage API key (input is hidden; press Enter when done): " ALPHAVANTAGE_API_KEY </dev/tty
         echo >&2
     else
-        echo "[X] Alpha Vantage API key is required. Set ALPHAVANTAGE_API_KEY or add it to $SCRIPT_DIR/.env." >&2
+        echo "[X] Alpha Vantage API key requires an interactive terminal." >&2
         exit 1
     fi
 fi
-if [[ -z "$ALPHAVANTAGE_API_KEY" ]]; then
-    echo "[X] No Alpha Vantage API key was entered." >&2
+
+for key in CT_ID CT_IP RTX_IP RTX_MAC RTX_USER ALPHAVANTAGE_API_KEY; do
+    if [[ -z "${!key:-}" ]]; then
+        echo "[X] Missing required config value: $key" >&2
+        exit 1
+    fi
+done
+
+if [[ "$CT_ID" == *[!0-9]* ]]; then
+    echo "[X] CT_ID must contain only digits." >&2
     exit 1
 fi
 echo -e ""
