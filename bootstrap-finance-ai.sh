@@ -26,7 +26,6 @@ The config file uses plain KEY=value lines (no shell expansion):
   RTX_IP=192.168.1.10
   RTX_MAC=AA:BB:CC:DD:EE:FF
   RTX_USER=rafal
-  ALPHAVANTAGE_API_KEY=your_api_key
 
 Keep the config file private (for example: chmod 600 FILE).
 EOF
@@ -172,7 +171,6 @@ if [[ -n "$CONFIG_FILE" ]]; then
     RTX_IP=""
     RTX_MAC=""
     RTX_USER=""
-    ALPHAVANTAGE_API_KEY=""
     seen_keys=" "
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%$'\r'}"
@@ -190,7 +188,9 @@ if [[ -n "$CONFIG_FILE" ]]; then
         value="${value%"${value##*[![:space:]]}"}"
 
         case "$key" in
-            CT_ID|CT_IP|RTX_IP|RTX_MAC|RTX_USER|ALPHAVANTAGE_API_KEY)
+            CT_ID|CT_IP|RTX_IP|RTX_MAC|RTX_USER)
+                ;;
+            ALPHAVANTAGE_API_KEY)
                 ;;
             *)
                 echo "[X] Unsupported config key: $key" >&2
@@ -206,6 +206,11 @@ if [[ -n "$CONFIG_FILE" ]]; then
         seen_keys+="$key "
         printf -v "$key" '%s' "$value"
     done < "$CONFIG_FILE"
+    case "$seen_keys" in
+        *" ALPHAVANTAGE_API_KEY "*)
+            echo "[!] Ignoring legacy ALPHAVANTAGE_API_KEY; Alpha Vantage is archived."
+            ;;
+    esac
 else
     echo -e "${CYAN}------------------------------------------------------------${NC}"
     echo -e "${CYAN}[?] CONFIGURATION STEP${NC}"
@@ -216,16 +221,9 @@ else
     read -r -p "3. Enter RTX Station IP Address (e.g., 192.168.1.10): " RTX_IP
     read -r -p "4. Enter RTX Station MAC Address (e.g., AA:BB:CC:DD:EE:FF): " RTX_MAC
     read -r -p "5. Enter RTX Station SSH User (e.g., rafal): " RTX_USER
-    if [[ -r /dev/tty ]]; then
-        IFS= read -r -s -p "6. Paste Alpha Vantage API key (input is hidden; press Enter when done): " ALPHAVANTAGE_API_KEY </dev/tty
-        echo >&2
-    else
-        echo "[X] Alpha Vantage API key requires an interactive terminal." >&2
-        exit 1
-    fi
 fi
 
-for key in CT_ID CT_IP RTX_IP RTX_MAC RTX_USER ALPHAVANTAGE_API_KEY; do
+for key in CT_ID CT_IP RTX_IP RTX_MAC RTX_USER; do
     if [[ -z "${!key:-}" ]]; then
         echo "[X] Missing required config value: $key" >&2
         exit 1
@@ -253,7 +251,6 @@ setup_ai_orchestrator() {
 RTX_IP=${RTX_IP}
 RTX_MAC=${RTX_MAC}
 RTX_SSH_USER=${RTX_USER}
-ALPHAVANTAGE_API_KEY=${ALPHAVANTAGE_API_KEY}
 
 # Ollama Endpoint
 OLLAMA_URL=http://${RTX_IP}:11434/api/generate
@@ -288,8 +285,9 @@ EOF
     fi
     
     # 3. Install Python packages inside venv
-    echo -e "${YELLOW}[->] Installing Python packages (requests, python-dotenv)...${NC}"
-    if ! pct exec "$id" -- "$HOMELAB_AI_DIR/venv/bin/pip" install requests python-dotenv; then
+    echo -e "${YELLOW}[->] Installing Python packages from requirements.txt...${NC}"
+    if ! pct push "$id" "$SCRIPT_DIR/requirements.txt" "$HOMELAB_AI_DIR/requirements.txt" ||
+       ! pct exec "$id" -- "$HOMELAB_AI_DIR/venv/bin/pip" install -r "$HOMELAB_AI_DIR/requirements.txt"; then
         echo -e "${RED}[X] Failed to install Python packages.${NC}" >&2
         return 1
     fi

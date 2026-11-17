@@ -1,10 +1,11 @@
+import csv
 import requests
 import sqlite3
 import json
 import math
 import os
 import sys
-import time
+import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -26,17 +27,7 @@ ANOMALY_FLAG_FILE = os.path.join(BASE_DIR, "logs", "trigger_anomaly.flag")
 
 # Threshold for triggering an immediate LLM analysis (e.g., -3.0%)
 ANOMALY_DROP_THRESHOLD = -3.0
-ALPHAVANTAGE_API_URL = "https://www.alphavantage.co/query"
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
-API_REQUEST_INTERVAL_SECONDS = 12
-API_NETWORK_RETRIES = 3
-API_RETRY_BACKOFF_SECONDS = (5, 15, 30)
-_last_api_request_at = 0.0
-
-ALPHAVANTAGE_EXCHANGE_SUFFIXES = {
-    ".DE": ".DEX",
-    ".AS": ".AMS",
-}
+STOOQ_CSV_URL = "https://stooq.pl/q/d/l/"
 
 # Ensure directories exist
 os.makedirs(os.path.join(BASE_DIR, "configs"), exist_ok=True)
@@ -65,7 +56,7 @@ def load_portfolio(filepath: str) -> dict:
 # DATABASE SETUP
 # ==============================================================================
 def init_db(db_path: str):
-    """Initializes the SQLite database and creates the metrics table if it doesn't exist."""
+    """Creates the metrics and price-history tables."""
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -84,10 +75,48 @@ def init_db(db_path: str):
                 news_json TEXT
             )
         ''')
+        cursor.execute('''
+            DELETE FROM daily_metrics
+            WHERE id NOT IN (
+                SELECT MAX(id)
+                FROM daily_metrics
+                GROUP BY date, ticker
+            )
+        ''')
+        removed_duplicate_rows = cursor.rowcount
+        if removed_duplicate_rows:
+            print(
+                f"[-] Removed {removed_duplicate_rows} duplicate daily metric "
+                "rows, keeping the latest entry for each ticker/date."
+            )
+        cursor.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_metrics_date_ticker
+            ON daily_metrics(date, ticker)
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_prices (
+                ticker TEXT NOT NULL,
+                date TEXT NOT NULL,
+                close REAL NOT NULL,
+                PRIMARY KEY (ticker, date)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_fetches (
+                ticker TEXT PRIMARY KEY,
+                fetched_date TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_sources (
+                ticker TEXT PRIMARY KEY,
+                source TEXT NOT NULL
+            )
+        ''')
         conn.commit()
 
 def save_to_db(db_path: str, record: tuple):
-    """Inserts a single daily record into the SQLite database."""
+    """Inserts or refreshes one metrics record per ticker and date."""
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -95,8 +124,134 @@ def save_to_db(db_path: str, record: tuple):
             (date, ticker, category, current_price, currency, daily_change_pct, 
              weekly_change_pct, sma200_dist_pct, rsi_14, technical_signal, news_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date, ticker) DO UPDATE SET
+                category = excluded.category,
+                current_price = excluded.current_price,
+                currency = excluded.currency,
+                daily_change_pct = excluded.daily_change_pct,
+                weekly_change_pct = excluded.weekly_change_pct,
+                sma200_dist_pct = excluded.sma200_dist_pct,
+                rsi_14 = excluded.rsi_14,
+                technical_signal = excluded.technical_signal,
+                news_json = excluded.news_json
         ''', record)
         conn.commit()
+
+
+def load_price_history(db_path: str, ticker_symbol: str) -> list[tuple[str, float]]:
+    with sqlite3.connect(db_path) as conn:
+        return conn.execute(
+            "SELECT date, close FROM daily_prices WHERE ticker = ? ORDER BY date",
+            (ticker_symbol,),
+        ).fetchall()
+
+
+def fetch_price_history(db_path: str, ticker_symbol: str, fetched_date: str) -> list[tuple[str, float]]:
+    with sqlite3.connect(db_path) as conn:
+        cached_fetch = conn.execute(
+            "SELECT fetched_date FROM price_fetches WHERE ticker = ?",
+            (ticker_symbol,),
+        ).fetchone()
+        price_source = conn.execute(
+            "SELECT source FROM price_sources WHERE ticker = ?",
+            (ticker_symbol,),
+        ).fetchone()
+        history = conn.execute(
+            "SELECT date, close FROM daily_prices WHERE ticker = ? ORDER BY date",
+            (ticker_symbol,),
+        ).fetchall()
+        if (
+            cached_fetch
+            and cached_fetch[0] == fetched_date
+            and price_source
+            and price_source[0] == "stooq"
+            and history
+        ):
+            print(f"[-] Using cached Stooq prices for {ticker_symbol}.")
+            return history
+
+    csv_path = None
+    try:
+        response = requests.get(
+            STOOQ_CSV_URL,
+            params={"s": to_stooq_symbol(ticker_symbol), "i": "d"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=".csv",
+            prefix="stooq_",
+            dir=os.path.join(BASE_DIR, "logs"),
+            delete=False,
+        ) as csv_file:
+            csv_path = csv_file.name
+            csv_file.write(response.content)
+
+        prices = load_stooq_csv(csv_path, ticker_symbol)
+        with sqlite3.connect(db_path) as conn:
+            existing_source = conn.execute(
+                "SELECT source FROM price_sources WHERE ticker = ?",
+                (ticker_symbol,),
+            ).fetchone()
+            has_existing_prices = conn.execute(
+                "SELECT 1 FROM daily_prices WHERE ticker = ? LIMIT 1",
+                (ticker_symbol,),
+            ).fetchone()
+            if has_existing_prices and (
+                not existing_source or existing_source[0] != "stooq"
+            ):
+                conn.execute(
+                    "DELETE FROM daily_prices WHERE ticker = ?",
+                    (ticker_symbol,),
+                )
+            conn.executemany(
+                '''
+                INSERT INTO daily_prices (ticker, date, close)
+                VALUES (?, ?, ?)
+                ON CONFLICT(ticker, date) DO UPDATE SET close = excluded.close
+                ''',
+                [(ticker_symbol, date, close) for date, close in prices],
+            )
+            conn.execute(
+                '''
+                INSERT INTO price_fetches (ticker, fetched_date)
+                VALUES (?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET fetched_date = excluded.fetched_date
+                ''',
+                (ticker_symbol, fetched_date),
+            )
+            conn.execute(
+                '''
+                INSERT INTO price_sources (ticker, source)
+                VALUES (?, 'stooq')
+                ON CONFLICT(ticker) DO UPDATE SET source = excluded.source
+                ''',
+                (ticker_symbol,),
+            )
+
+        imported_count = len(prices)
+    except StooqError:
+        raise
+    except requests.exceptions.RequestException as e:
+        raise StooqError(
+            f"Stooq download failed for {ticker_symbol}: {e}",
+            stop_run=True,
+        ) from e
+    except (OSError, sqlite3.Error) as e:
+        raise StooqError(
+            f"Unable to process Stooq data for {ticker_symbol}: {e}"
+        ) from e
+    finally:
+        if csv_path is not None:
+            os.unlink(csv_path)
+
+    print(
+        f"[+] Imported {imported_count} Stooq daily closes for {ticker_symbol}; "
+        "temporary CSV removed."
+    )
+    return load_price_history(db_path, ticker_symbol)
+
 
 # ==============================================================================
 # DATA SCRAPING FUNCTIONS
@@ -115,97 +270,56 @@ def calculate_rsi(closes: list[float], window: int = 14) -> float:
     relative_strength = average_gain / average_loss
     return 100 - (100 / (1 + relative_strength))
 
-class AlphaVantageError(Exception):
+class StooqError(Exception):
     def __init__(self, message: str, stop_run: bool = False):
         super().__init__(message)
         self.stop_run = stop_run
 
 
-def to_alphavantage_symbol(ticker_symbol: str) -> str:
-    for source_suffix, target_suffix in ALPHAVANTAGE_EXCHANGE_SUFFIXES.items():
-        if ticker_symbol.endswith(source_suffix):
-            return f"{ticker_symbol[:-len(source_suffix)]}{target_suffix}"
-    return ticker_symbol
+def to_stooq_symbol(ticker_symbol: str) -> str:
+    if ticker_symbol.endswith(".AS"):
+        ticker_symbol = f"{ticker_symbol[:-3]}.NL"
+    elif "." not in ticker_symbol:
+        ticker_symbol = f"{ticker_symbol}.US"
+    return ticker_symbol.lower()
 
 
-def fetch_alphavantage_data(function: str, **params) -> dict:
-    global _last_api_request_at
-
-    if not ALPHAVANTAGE_API_KEY:
-        raise AlphaVantageError("ALPHAVANTAGE_API_KEY is not configured.")
-
-    response = None
-    for attempt in range(API_NETWORK_RETRIES + 1):
-        elapsed = time.monotonic() - _last_api_request_at
-        if _last_api_request_at and elapsed < API_REQUEST_INTERVAL_SECONDS:
-            time.sleep(API_REQUEST_INTERVAL_SECONDS - elapsed)
-
-        try:
-            response = requests.get(
-                ALPHAVANTAGE_API_URL,
-                params={
-                    "function": function,
-                    "apikey": ALPHAVANTAGE_API_KEY,
-                    **params,
-                },
-                timeout=30,
-            )
-            _last_api_request_at = time.monotonic()
-            response.raise_for_status()
-            break
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            _last_api_request_at = time.monotonic()
-            if attempt < API_NETWORK_RETRIES:
-                delay = API_RETRY_BACKOFF_SECONDS[attempt]
-                print(
-                    f"[-] Alpha Vantage network error; retrying in {delay}s "
-                    f"({attempt + 1}/{API_NETWORK_RETRIES})."
-                )
-                time.sleep(delay)
-                continue
-            error_message = str(e).replace(ALPHAVANTAGE_API_KEY, "[redacted]")
-            raise AlphaVantageError(
-                f"Alpha Vantage network request failed after "
-                f"{API_NETWORK_RETRIES + 1} attempts: {error_message}",
-                stop_run=True,
-            ) from e
-        except requests.exceptions.RequestException as e:
-            _last_api_request_at = time.monotonic()
-            error_message = str(e).replace(ALPHAVANTAGE_API_KEY, "[redacted]")
-            raise AlphaVantageError(
-                f"Alpha Vantage request failed: {error_message}",
-                stop_run=True,
-            ) from e
-
+def load_stooq_csv(csv_path: str, ticker_symbol: str) -> list[tuple[str, float]]:
     try:
-        data = response.json()
-    except ValueError as e:
-        raise AlphaVantageError("Alpha Vantage returned invalid JSON.") from e
+        with open(csv_path, newline="", encoding="utf-8-sig") as csv_file:
+            reader = csv.DictReader(csv_file)
+            columns = {
+                name.strip().lower(): name
+                for name in (reader.fieldnames or [])
+            }
+            if "date" not in columns or "close" not in columns:
+                raise StooqError(
+                    f"Stooq returned an invalid CSV for {ticker_symbol}.",
+                    stop_run=True,
+                )
 
-    if not isinstance(data, dict):
-        raise AlphaVantageError("Alpha Vantage returned an unexpected response.")
+            prices_by_date = {}
+            for row in reader:
+                price_date = row[columns["date"]].strip()
+                close = float(row[columns["close"]])
+                datetime.strptime(price_date, "%Y-%m-%d")
+                if not math.isfinite(close) or close <= 0:
+                    raise ValueError(f"Invalid close value for {price_date}.")
+                prices_by_date[price_date] = close
+    except StooqError:
+        raise
+    except (KeyError, OSError, TypeError, ValueError) as e:
+        raise StooqError(
+            f"Unable to read Stooq CSV for {ticker_symbol}: {e}",
+            stop_run=True,
+        ) from e
 
-    error_message = data.get("Error Message")
-    if error_message:
-        message = str(error_message)
-        stop_run = any(
-            phrase in message.lower()
-            for phrase in ("call frequency", "requests per day", "rate limit", "call volume")
+    if not prices_by_date:
+        raise StooqError(
+            f"Stooq returned no daily prices for {ticker_symbol}.",
+            stop_run=True,
         )
-        raise AlphaVantageError(message, stop_run=stop_run)
-
-    notice = data.get("Note") or data.get("Information")
-    if notice:
-        raise AlphaVantageError(str(notice), stop_run=True)
-
-    return data
-
-
-def _time_series(data: dict, prefix: str) -> dict:
-    for key, value in data.items():
-        if key.startswith(prefix) and isinstance(value, dict):
-            return value
-    raise AlphaVantageError(f"Alpha Vantage response is missing {prefix}.")
+    return sorted(prices_by_date.items())
 
 
 def _get_currency(ticker_symbol: str) -> str:
@@ -214,113 +328,51 @@ def _get_currency(ticker_symbol: str) -> str:
     return "USD"
 
 
-def fetch_technical_data(ticker_symbol: str) -> dict | None:
-    try:
-        provider_symbol = to_alphavantage_symbol(ticker_symbol)
-        daily_response = fetch_alphavantage_data(
-            "TIME_SERIES_DAILY",
-            symbol=provider_symbol,
-            outputsize="compact",
+def calculate_technical_data(
+    ticker_symbol: str,
+    price_history: list[tuple[str, float]],
+) -> dict:
+    closes = [close for _, close in price_history]
+    current_price = closes[-1]
+    daily_change = (
+        ((current_price - closes[-2]) / closes[-2]) * 100
+        if len(closes) >= 2 and closes[-2]
+        else 0.0
+    )
+    weekly_change = (
+        ((current_price - closes[-6]) / closes[-6]) * 100
+        if len(closes) >= 6 and closes[-6]
+        else 0.0
+    )
+
+    current_rsi = calculate_rsi(closes)
+    if math.isfinite(current_rsi):
+        rsi_value = round(current_rsi, 2)
+        tech_signal = (
+            "OVERSOLD" if current_rsi < 30
+            else "OVERBOUGHT" if current_rsi > 70
+            else "NEUTRAL"
         )
-        daily_series = _time_series(daily_response, "Time Series (Daily)")
-        closes = [
-            float(values["4. close"])
-            for _, values in sorted(daily_series.items())
-        ]
-        if not closes:
-            print(f"[!] No daily price data returned for {ticker_symbol}.")
-            return None
+    else:
+        rsi_value = None
+        tech_signal = "NEUTRAL"
 
-        current_price = closes[-1]
-        
-        # Calculate daily change (today vs yesterday)
-        if len(closes) >= 2:
-            prev_close = closes[-2]
-            daily_change = ((current_price - prev_close) / prev_close) * 100
-        else:
-            daily_change = 0.0
+    sma_dist_pct = None
+    if len(closes) >= 200:
+        sma_200 = sum(closes[-200:]) / 200
+        if sma_200:
+            sma_dist_pct = round(((current_price - sma_200) / sma_200) * 100, 2)
 
-        # Calculate weekly change (today vs 5 sessions ago)
-        if len(closes) >= 6:
-            weekly_close = closes[-6]
-            weekly_change = ((current_price - weekly_close) / weekly_close) * 100
-        else:
-            weekly_change = 0.0
-
-        current_rsi = calculate_rsi(closes)
-
-        sma_response = fetch_alphavantage_data(
-            "SMA",
-            symbol=provider_symbol,
-            interval="daily",
-            time_period=200,
-            series_type="close",
-        )
-        sma_series = _time_series(sma_response, "Technical Analysis: SMA")
-        latest_sma_date = max(sma_series)
-        sma_200 = float(sma_series[latest_sma_date]["SMA"])
-        sma_dist_pct = ((current_price - sma_200) / sma_200) * 100
-
-        if current_rsi < 30:
-            tech_signal = "OVERSOLD"
-        elif current_rsi > 70:
-            tech_signal = "OVERBOUGHT"
-        else:
-            tech_signal = "NEUTRAL"
-
-        return {
-            "current_price": round(current_price, 2),
-            "currency": _get_currency(ticker_symbol),
-            "daily_change_pct": round(daily_change, 2),
-            "weekly_change_pct": round(weekly_change, 2),
-            "sma200_dist_pct": round(sma_dist_pct, 2),
-            "rsi_14": round(current_rsi, 2),
-            "technical_signal": tech_signal
-        }
-    except AlphaVantageError:
-        raise
-    except Exception as e:
-        print(f"[!] Error fetching technical data for {ticker_symbol}: {e}")
-        return None
-
-def fetch_news_data(ticker_symbols: list[str]) -> dict[str, list[str]]:
-    if not ticker_symbols:
-        return {}
-
-    provider_symbols = {
-        to_alphavantage_symbol(ticker_symbol): ticker_symbol
-        for ticker_symbol in ticker_symbols
+    return {
+        "price_date": price_history[-1][0],
+        "current_price": round(current_price, 2),
+        "currency": _get_currency(ticker_symbol),
+        "daily_change_pct": round(daily_change, 2),
+        "weekly_change_pct": round(weekly_change, 2),
+        "sma200_dist_pct": sma_dist_pct,
+        "rsi_14": rsi_value,
+        "technical_signal": tech_signal,
     }
-
-    try:
-        response = fetch_alphavantage_data(
-            "NEWS_SENTIMENT",
-            tickers=",".join(provider_symbols),
-            sort="LATEST",
-            limit=200,
-        )
-        news_by_ticker = {ticker: [] for ticker in ticker_symbols}
-        for article in response.get("feed", []):
-            title = article.get("title")
-            if not title:
-                continue
-            for sentiment in article.get("ticker_sentiment", []):
-                source_symbol = sentiment.get("ticker")
-                ticker = provider_symbols.get(source_symbol)
-                if ticker and title not in news_by_ticker[ticker]:
-                    news_by_ticker[ticker].append(title)
-        return {
-            ticker: headlines[:3] or ["No significant news."]
-            for ticker, headlines in news_by_ticker.items()
-        }
-    except AlphaVantageError as e:
-        if e.stop_run:
-            raise
-        print(f"[!] Error fetching Alpha Vantage news: {e}")
-        return {ticker: ["Error fetching news."] for ticker in ticker_symbols}
-    except Exception as e:
-        print(f"[!] Error fetching Alpha Vantage news: {e}")
-        return {ticker: ["Error fetching news."] for ticker in ticker_symbols}
 
 # ==============================================================================
 # MAIN EXECUTION
@@ -329,10 +381,6 @@ def main():
     current_date = datetime.now().strftime('%Y-%m-%d')
     print(f"[*] Starting daily market data collection: {current_date}")
 
-    if not ALPHAVANTAGE_API_KEY:
-        print("[!] ALPHAVANTAGE_API_KEY is missing from the environment.")
-        sys.exit(1)
-    
     portfolio = load_portfolio(CONFIG_FILE)
     init_db(DB_FILE)
     
@@ -352,35 +400,30 @@ def main():
         for ticker in tickers:
             print(f"    -> Scraping: {ticker}")
             try:
-                hard_data = fetch_technical_data(ticker)
-            except AlphaVantageError as e:
-                print(f"[!] Alpha Vantage error for {ticker}: {e}")
+                price_history = fetch_price_history(DB_FILE, ticker, current_date)
+                if not price_history:
+                    raise StooqError(f"No stored daily prices for {ticker}.")
+                hard_data = calculate_technical_data(ticker, price_history)
+            except StooqError as e:
+                print(f"[!] Stooq error for {ticker}: {e}")
                 failed_tickers.append(ticker)
                 if e.stop_run:
-                    print("[!] Stopping early because an API request failed or Alpha Vantage reported a limit.")
+                    print("[!] Stopping early because the Stooq download failed.")
                     stop_scraping = True
                     break
                 continue
-
             if hard_data is None:
                 failed_tickers.append(ticker)
                 continue
+            if hard_data["sma200_dist_pct"] is None:
+                print(
+                    f"[-] SMA200 unavailable for {ticker}: "
+                    f"{len(price_history)} of 200 daily closes collected."
+                )
             market_data[ticker] = hard_data
 
         if stop_scraping:
             break
-
-    valid_tickers = [ticker for ticker in all_tickers if ticker in market_data]
-    if stop_scraping:
-        news_by_ticker = {ticker: ["Error fetching news."] for ticker in valid_tickers}
-    else:
-        try:
-            news_by_ticker = fetch_news_data(valid_tickers)
-        except AlphaVantageError as e:
-            print(f"[!] Alpha Vantage news error: {e}")
-            if e.stop_run:
-                failed_tickers.extend(ticker for ticker in valid_tickers if ticker not in failed_tickers)
-            news_by_ticker = {ticker: ["Error fetching news."] for ticker in valid_tickers}
 
     for category, tickers in portfolio.items():
         for ticker in tickers:
@@ -393,7 +436,7 @@ def main():
                 anomaly_detected = True
 
             db_record = (
-                current_date,
+                hard_data["price_date"],
                 ticker,
                 category,
                 hard_data["current_price"],
@@ -403,7 +446,7 @@ def main():
                 hard_data["sma200_dist_pct"],
                 hard_data["rsi_14"],
                 hard_data["technical_signal"],
-                json.dumps(news_by_ticker.get(ticker, ["No significant news."]), ensure_ascii=False)
+                None
             )
             save_to_db(DB_FILE, db_record)
 
