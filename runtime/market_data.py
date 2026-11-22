@@ -1,5 +1,5 @@
 import csv
-import haslib
+import hashlib
 import io
 import json
 import math
