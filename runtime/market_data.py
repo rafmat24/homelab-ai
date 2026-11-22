@@ -1,9 +1,11 @@
 import csv
+import haslib
 import io
 import json
 import math
 import os
 import random
+import re
 import sqlite3
 import sys
 import time
@@ -34,6 +36,41 @@ INCREMENTAL_FETCH_DAYS = 14  # Wystarczy na pokrycie przerw świątecznych i wee
 
 os.makedirs(os.path.join(BASE_DIR, "configs"), exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
+
+
+# =============================================================================
+# STOOQ PROOF-OF-WORK CHALLENGE SOLVER
+# =============================================================================
+def solve_stooq_pow(session: requests.Session, html_text: str, page_url: str) -> bool:
+    """Solves Stooq's SHA-256 Proof-of-Work JS challenge and stores the session cookie."""
+    c_match = re.search(r'const\s+c\s*=\s*"([^"]+)"', html_text)
+    d_match = re.search(r'\bd\s*=\s*(\d+)', html_text)
+    if not c_match or not d_match:
+        return False
+
+    challenge = c_match.group(1)
+    difficulty = int(d_match.group(1))
+    target_prefix = "0" * difficulty
+
+    nonce = 0
+    while True:
+        digest = hashlib.sha256(f"{challenge}{nonce}".encode("utf-8")).hexdigest()
+        if digest.startswith(target_prefix):
+            break
+        nonce += 1
+
+    verify_url = "https://stooq.pl/__verify"
+    resp = session.post(
+        verify_url,
+        data={"c": challenge, "n": str(nonce)},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://stooq.pl",
+            "Referer": page_url,
+        },
+        timeout=15,
+    )
+    return resp.ok
 
 
 # ==============================================================================
@@ -274,7 +311,8 @@ def fetch_price_history(
             return history, False
 
     has_valid_history = is_stooq_source and len(history) >= 200
-    params = {"s": to_stooq_symbol(ticker_symbol), "i": "d"}
+    stooq_sym = to_stooq_symbol(ticker_symbol)
+    params = {"s": stooq_sym, "i": "d"}
 
     if has_valid_history:
         d2 = datetime.now().strftime("%Y%m%d")
@@ -285,6 +323,16 @@ def fetch_price_history(
     try:
         response = session.get(STOOQ_CSV_URL, params=params, timeout=30)
         response.raise_for_status()
+
+        if "/__verify" in response.text:
+            print(f"    [*] Solving Stooq PoW challenge for {ticker_symbol}...")
+            if not solve_stooq_pow(session, response.text, response.url):
+                raise StooqError(
+                    f"Failed to solve Stooq PoW challenge for {ticker_symbol}.",
+                    stop_run=True,
+                )
+            response = session.get(STOOQ_CSV_URL, params=params, timeout=30)
+            response.raise_for_status()
     except requests.exceptions.RequestException as e:
         raise StooqError(
             f"Stooq HTTP request failed for {ticker_symbol}: {e}",
@@ -333,7 +381,6 @@ def fetch_price_history(
     mode_label = "incremental" if has_valid_history else "full history"
     print(f"[+] Imported {len(prices)} Stooq daily closes ({mode_label}) for {ticker_symbol}.")
     return load_price_history(db_path, ticker_symbol), True
-
 
 # ==============================================================================
 # TECHNICAL INDICATORS
