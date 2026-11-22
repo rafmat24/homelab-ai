@@ -1,12 +1,14 @@
 import csv
-import requests
-import sqlite3
+import io
 import json
 import math
 import os
+import random
+import sqlite3
 import sys
-import tempfile
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+import requests
 from dotenv import load_dotenv
 
 # ==============================================================================
@@ -21,17 +23,18 @@ DEFAULT_BASE_DIR = (
 BASE_DIR = os.path.abspath(os.getenv("HOMELAB_AI_DIR", DEFAULT_BASE_DIR))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 load_dotenv(ENV_FILE)
+
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "portfolio.json")
 DB_FILE = os.path.join(BASE_DIR, "logs", "market_data.db")
 ANOMALY_FLAG_FILE = os.path.join(BASE_DIR, "logs", "trigger_anomaly.flag")
 
-# Threshold for triggering an immediate LLM analysis (e.g., -3.0%)
 ANOMALY_DROP_THRESHOLD = -3.0
 STOOQ_CSV_URL = "https://stooq.pl/q/d/l/"
+INCREMENTAL_FETCH_DAYS = 14  # Wystarczy na pokrycie przerw świątecznych i weekendów
 
-# Ensure directories exist
 os.makedirs(os.path.join(BASE_DIR, "configs"), exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
+
 
 # ==============================================================================
 # HELPER FUNCTIONS - ALERTS & CONFIG
@@ -41,6 +44,7 @@ def send_error_alert(subject: str, message: str):
     print(f"[EMAIL ALERT] Subject: {subject}")
     print(f"[EMAIL ALERT] Body: {message}")
 
+
 def load_portfolio(filepath: str) -> dict:
     """Loads the ticker configuration from an external JSON file (Fail Fast)."""
     if not os.path.exists(filepath):
@@ -48,9 +52,24 @@ def load_portfolio(filepath: str) -> dict:
         print(f"[!] {error_msg}")
         send_error_alert("AI Agent Error: Missing Portfolio Config", error_msg)
         sys.exit(1)
-        
-    with open(filepath, 'r', encoding='utf-8') as f:
+
+    with open(filepath, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def build_stooq_session() -> requests.Session:
+    """Creates an HTTP session with browser-like headers to avoid instant blocks."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/csv,text/plain,*/*",
+        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    })
+    return session
+
 
 # ==============================================================================
 # DATABASE SETUP
@@ -115,6 +134,7 @@ def init_db(db_path: str):
         ''')
         conn.commit()
 
+
 def save_to_db(db_path: str, record: tuple):
     """Inserts or refreshes one metrics record per ticker and date."""
     with sqlite3.connect(db_path) as conn:
@@ -146,7 +166,93 @@ def load_price_history(db_path: str, ticker_symbol: str) -> list[tuple[str, floa
         ).fetchall()
 
 
-def fetch_price_history(db_path: str, ticker_symbol: str, fetched_date: str) -> list[tuple[str, float]]:
+# ==============================================================================
+# STOOQ SCRAPING & PARSING
+# ==============================================================================
+class StooqError(Exception):
+    def __init__(self, message: str, stop_run: bool = False):
+        super().__init__(message)
+        self.stop_run = stop_run
+
+
+def to_stooq_symbol(ticker_symbol: str) -> str:
+    """Maps standard Yahoo/broker tickers to Stooq conventions."""
+    if ticker_symbol.endswith(".AS"):
+        ticker_symbol = f"{ticker_symbol[:-3]}.NL"
+    elif "." not in ticker_symbol:
+        ticker_symbol = f"{ticker_symbol}.US"
+    return ticker_symbol.lower()
+
+
+def parse_stooq_csv_text(csv_text: str, ticker_symbol: str, allow_empty: bool = False) -> list[tuple[str, float]]:
+    """Parses both Polish (Data/Zamkniecie) and English (Date/Close) Stooq CSV formats."""
+    cleaned = csv_text.strip()
+
+    if "Przekroczono dzienny limit" in cleaned or "Exceeded the daily limit" in cleaned:
+        raise StooqError(
+            f"Stooq daily rate limit reached while fetching {ticker_symbol}.",
+            stop_run=True,
+        )
+
+    if not cleaned or cleaned.startswith(("Brak danych", "No data")):
+        if allow_empty:
+            return []
+        raise StooqError(
+            f"Stooq returned no daily prices for {ticker_symbol}.",
+            stop_run=False,
+        )
+
+    try:
+        reader = csv.DictReader(io.StringIO(cleaned))
+        columns = {
+            name.strip().lower(): name
+            for name in (reader.fieldnames or [])
+        }
+        date_col = columns.get("data") or columns.get("date")
+        close_col = columns.get("zamkniecie") or columns.get("close")
+
+        if not date_col or not close_col:
+            preview = cleaned[:120].replace("\n", " ")
+            raise StooqError(
+                f"Stooq returned unexpected CSV headers for {ticker_symbol}: {preview}",
+                stop_run=True,
+            )
+
+        prices_by_date = {}
+        for row in reader:
+            price_date = row[date_col].strip()
+            close = float(row[close_col])
+            datetime.strptime(price_date, "%Y-%m-%d")
+            if not math.isfinite(close) or close <= 0:
+                raise ValueError(f"Invalid close value for {price_date}.")
+            prices_by_date[price_date] = close
+    except StooqError:
+        raise
+    except (KeyError, TypeError, ValueError) as e:
+        raise StooqError(
+            f"Unable to parse Stooq CSV for {ticker_symbol}: {e}",
+            stop_run=False,
+        ) from e
+
+    if not prices_by_date and not allow_empty:
+        raise StooqError(
+            f"Stooq CSV contained 0 valid rows for {ticker_symbol}.",
+            stop_run=False,
+        )
+
+    return sorted(prices_by_date.items())
+
+
+def fetch_price_history(
+    db_path: str,
+    ticker_symbol: str,
+    fetched_date: str,
+    session: requests.Session,
+) -> tuple[list[tuple[str, float]], bool]:
+    """
+    Fetches Stooq prices (incremental if history exists, full backfill otherwise).
+    Returns (price_history, made_network_request).
+    """
     with sqlite3.connect(db_path) as conn:
         cached_fetch = conn.execute(
             "SELECT fetched_date FROM price_fetches WHERE ticker = ?",
@@ -160,51 +266,44 @@ def fetch_price_history(db_path: str, ticker_symbol: str, fetched_date: str) -> 
             "SELECT date, close FROM daily_prices WHERE ticker = ? ORDER BY date",
             (ticker_symbol,),
         ).fetchall()
-        if (
-            cached_fetch
-            and cached_fetch[0] == fetched_date
-            and price_source
-            and price_source[0] == "stooq"
-            and history
-        ):
+
+        is_stooq_source = bool(price_source and price_source[0] == "stooq")
+
+        if cached_fetch and cached_fetch[0] == fetched_date and is_stooq_source and history:
             print(f"[-] Using cached Stooq prices for {ticker_symbol}.")
-            return history
+            return history, False
 
-    csv_path = None
+    has_valid_history = is_stooq_source and len(history) >= 200
+    params = {"s": to_stooq_symbol(ticker_symbol), "i": "d"}
+
+    if has_valid_history:
+        d2 = datetime.now().strftime("%Y%m%d")
+        d1 = (datetime.now() - timedelta(days=INCREMENTAL_FETCH_DAYS)).strftime("%Y%m%d")
+        params["d1"] = d1
+        params["d2"] = d2
+
     try:
-        response = requests.get(
-            STOOQ_CSV_URL,
-            params={"s": to_stooq_symbol(ticker_symbol), "i": "d"},
-            timeout=30,
-        )
+        response = session.get(STOOQ_CSV_URL, params=params, timeout=30)
         response.raise_for_status()
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            suffix=".csv",
-            prefix="stooq_",
-            dir=os.path.join(BASE_DIR, "logs"),
-            delete=False,
-        ) as csv_file:
-            csv_path = csv_file.name
-            csv_file.write(response.content)
+    except requests.exceptions.RequestException as e:
+        raise StooqError(
+            f"Stooq HTTP request failed for {ticker_symbol}: {e}",
+            stop_run=True,
+        ) from e
 
-        prices = load_stooq_csv(csv_path, ticker_symbol)
-        with sqlite3.connect(db_path) as conn:
-            existing_source = conn.execute(
-                "SELECT source FROM price_sources WHERE ticker = ?",
+    prices = parse_stooq_csv_text(
+        response.text,
+        ticker_symbol,
+        allow_empty=has_valid_history,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        if history and not is_stooq_source:
+            conn.execute(
+                "DELETE FROM daily_prices WHERE ticker = ?",
                 (ticker_symbol,),
-            ).fetchone()
-            has_existing_prices = conn.execute(
-                "SELECT 1 FROM daily_prices WHERE ticker = ? LIMIT 1",
-                (ticker_symbol,),
-            ).fetchone()
-            if has_existing_prices and (
-                not existing_source or existing_source[0] != "stooq"
-            ):
-                conn.execute(
-                    "DELETE FROM daily_prices WHERE ticker = ?",
-                    (ticker_symbol,),
-                )
+            )
+        if prices:
             conn.executemany(
                 '''
                 INSERT INTO daily_prices (ticker, date, close)
@@ -213,118 +312,60 @@ def fetch_price_history(db_path: str, ticker_symbol: str, fetched_date: str) -> 
                 ''',
                 [(ticker_symbol, date, close) for date, close in prices],
             )
-            conn.execute(
-                '''
-                INSERT INTO price_fetches (ticker, fetched_date)
-                VALUES (?, ?)
-                ON CONFLICT(ticker) DO UPDATE SET fetched_date = excluded.fetched_date
-                ''',
-                (ticker_symbol, fetched_date),
-            )
-            conn.execute(
-                '''
-                INSERT INTO price_sources (ticker, source)
-                VALUES (?, 'stooq')
-                ON CONFLICT(ticker) DO UPDATE SET source = excluded.source
-                ''',
-                (ticker_symbol,),
-            )
+        conn.execute(
+            '''
+            INSERT INTO price_fetches (ticker, fetched_date)
+            VALUES (?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET fetched_date = excluded.fetched_date
+            ''',
+            (ticker_symbol, fetched_date),
+        )
+        conn.execute(
+            '''
+            INSERT INTO price_sources (ticker, source)
+            VALUES (?, 'stooq')
+            ON CONFLICT(ticker) DO UPDATE SET source = excluded.source
+            ''',
+            (ticker_symbol,),
+        )
+        conn.commit()
 
-        imported_count = len(prices)
-    except StooqError:
-        raise
-    except requests.exceptions.RequestException as e:
-        raise StooqError(
-            f"Stooq download failed for {ticker_symbol}: {e}",
-            stop_run=True,
-        ) from e
-    except (OSError, sqlite3.Error) as e:
-        raise StooqError(
-            f"Unable to process Stooq data for {ticker_symbol}: {e}"
-        ) from e
-    finally:
-        if csv_path is not None:
-            os.unlink(csv_path)
-
-    print(
-        f"[+] Imported {imported_count} Stooq daily closes for {ticker_symbol}; "
-        "temporary CSV removed."
-    )
-    return load_price_history(db_path, ticker_symbol)
+    mode_label = "incremental" if has_valid_history else "full history"
+    print(f"[+] Imported {len(prices)} Stooq daily closes ({mode_label}) for {ticker_symbol}.")
+    return load_price_history(db_path, ticker_symbol), True
 
 
 # ==============================================================================
-# DATA SCRAPING FUNCTIONS
+# TECHNICAL INDICATORS
 # ==============================================================================
 def calculate_rsi(closes: list[float], window: int = 14) -> float:
+    """Calculates Wilder's RSI-14 across the full available close series."""
     if len(closes) <= window:
         return math.nan
 
-    changes = [current - previous for previous, current in zip(closes, closes[1:])]
-    recent_changes = changes[-window:]
-    average_gain = sum(max(change, 0) for change in recent_changes) / window
-    average_loss = sum(max(-change, 0) for change in recent_changes) / window
+    changes = [curr - prev for prev, curr in zip(closes, closes[1:])]
+    gains = [max(c, 0.0) for c in changes]
+    losses = [max(-c, 0.0) for c in changes]
 
-    if average_loss == 0:
-        return 100.0 if average_gain > 0 else math.nan
-    relative_strength = average_gain / average_loss
-    return 100 - (100 / (1 + relative_strength))
+    avg_gain = sum(gains[:window]) / window
+    avg_loss = sum(losses[:window]) / window
 
-class StooqError(Exception):
-    def __init__(self, message: str, stop_run: bool = False):
-        super().__init__(message)
-        self.stop_run = stop_run
+    for gain, loss in zip(gains[window:], losses[window:]):
+        avg_gain = ((avg_gain * (window - 1)) + gain) / window
+        avg_loss = ((avg_loss * (window - 1)) + loss) / window
 
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else math.nan
 
-def to_stooq_symbol(ticker_symbol: str) -> str:
-    if ticker_symbol.endswith(".AS"):
-        ticker_symbol = f"{ticker_symbol[:-3]}.NL"
-    elif "." not in ticker_symbol:
-        ticker_symbol = f"{ticker_symbol}.US"
-    return ticker_symbol.lower()
-
-
-def load_stooq_csv(csv_path: str, ticker_symbol: str) -> list[tuple[str, float]]:
-    try:
-        with open(csv_path, newline="", encoding="utf-8-sig") as csv_file:
-            reader = csv.DictReader(csv_file)
-            columns = {
-                name.strip().lower(): name
-                for name in (reader.fieldnames or [])
-            }
-            if "date" not in columns or "close" not in columns:
-                raise StooqError(
-                    f"Stooq returned an invalid CSV for {ticker_symbol}.",
-                    stop_run=True,
-                )
-
-            prices_by_date = {}
-            for row in reader:
-                price_date = row[columns["date"]].strip()
-                close = float(row[columns["close"]])
-                datetime.strptime(price_date, "%Y-%m-%d")
-                if not math.isfinite(close) or close <= 0:
-                    raise ValueError(f"Invalid close value for {price_date}.")
-                prices_by_date[price_date] = close
-    except StooqError:
-        raise
-    except (KeyError, OSError, TypeError, ValueError) as e:
-        raise StooqError(
-            f"Unable to read Stooq CSV for {ticker_symbol}: {e}",
-            stop_run=True,
-        ) from e
-
-    if not prices_by_date:
-        raise StooqError(
-            f"Stooq returned no daily prices for {ticker_symbol}.",
-            stop_run=True,
-        )
-    return sorted(prices_by_date.items())
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def _get_currency(ticker_symbol: str) -> str:
-    if ticker_symbol.endswith((".DE", ".AS")):
+    if ticker_symbol.endswith((".DE", ".AS", ".NL")):
         return "EUR"
+    if ticker_symbol.endswith(".UK"):
+        return "GBP"
     return "USD"
 
 
@@ -374,47 +415,49 @@ def calculate_technical_data(
         "technical_signal": tech_signal,
     }
 
+
 # ==============================================================================
 # MAIN EXECUTION
 # ==============================================================================
 def main():
-    current_date = datetime.now().strftime('%Y-%m-%d')
+    current_date = datetime.now().strftime("%Y-%m-%d")
     print(f"[*] Starting daily market data collection: {current_date}")
 
     portfolio = load_portfolio(CONFIG_FILE)
     init_db(DB_FILE)
-    
+    session = build_stooq_session()
+
     anomaly_detected = False
     market_data = {}
     failed_tickers = []
     stop_scraping = False
-    all_tickers = [
-        ticker
-        for tickers in portfolio.values()
-        for ticker in tickers
-    ]
+    all_tickers = [ticker for tickers in portfolio.values() for ticker in tickers]
 
     for category, tickers in portfolio.items():
         print(f"[-] Processing category: {category}")
-        
+
         for ticker in tickers:
-            print(f"    -> Scraping: {ticker}")
+            print(f"    -> Scraping: {ticker} (stooq: {to_stooq_symbol(ticker)})")
             try:
-                price_history = fetch_price_history(DB_FILE, ticker, current_date)
+                price_history, made_request = fetch_price_history(
+                    DB_FILE, ticker, current_date, session
+                )
+                if made_request:
+                    time.sleep(random.uniform(2.5, 4.5))
+
                 if not price_history:
                     raise StooqError(f"No stored daily prices for {ticker}.")
+
                 hard_data = calculate_technical_data(ticker, price_history)
             except StooqError as e:
                 print(f"[!] Stooq error for {ticker}: {e}")
                 failed_tickers.append(ticker)
                 if e.stop_run:
-                    print("[!] Stopping early because the Stooq download failed.")
+                    print("[!] Stopping early due to critical Stooq error.")
                     stop_scraping = True
                     break
                 continue
-            if hard_data is None:
-                failed_tickers.append(ticker)
-                continue
+
             if hard_data["sma200_dist_pct"] is None:
                 print(
                     f"[-] SMA200 unavailable for {ticker}: "
@@ -446,20 +489,20 @@ def main():
                 hard_data["sma200_dist_pct"],
                 hard_data["rsi_14"],
                 hard_data["technical_signal"],
-                None
+                None,
             )
             save_to_db(DB_FILE, db_record)
 
-    # If an anomaly was detected, create a flag file
     if anomaly_detected:
         print(f"[*] Anomaly threshold ({ANOMALY_DROP_THRESHOLD}%) breached. Setting trigger flag.")
-        with open(ANOMALY_FLAG_FILE, 'w') as f:
+        with open(ANOMALY_FLAG_FILE, "w", encoding="utf-8") as f:
             f.write(current_date)
-            
+
     print(f"[+] Saved {len(market_data)} of {len(all_tickers)} assets to {DB_FILE}")
     if failed_tickers:
         print(f"[!] Failed to collect data for: {', '.join(failed_tickers)}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
